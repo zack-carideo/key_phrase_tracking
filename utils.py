@@ -1,4 +1,4 @@
-import sys, os,  requests, io, zipfile 
+import sys, os,  requests, io, zipfile , re 
 from collections import defaultdict
 from typing import Dict, List
 from nltk.stem import PorterStemmer
@@ -8,6 +8,10 @@ from sklearn.feature_extraction.text import TfidfTransformer, TfidfVectorizer
 
 #stemmer    
 stemmer = PorterStemmer()
+
+
+def nearest(items, pivot): 
+    return min(items, key=lambda x: abs(x-pivot))
 
 def download_and_unzip(url: str, destination_folder: str):
     
@@ -114,5 +118,51 @@ def get_top_idf_terms(df_tokens, stopwords = None , topn=20, n_df = None, sent_t
                                         ,  stop_words=stopwords)
     
     tfidf_vec = Tfidf_vectorizer.fit_transform([v for v in df])
-    topterms = topn_tfidf_freq(Tfidf_vectorizer,tfidf_vec,topn=topn)
+    topterms = topn_tfidf_freq(Tfidf_vectorizer,tfidf_vec,n=topn)
     return topterms[0]
+
+
+def incorp_static_phrases(doc,phrase_tups: dict):
+
+    if type(phrase_tups).__name__ == 'dict': 
+        
+        for item in phrase_tups.items():
+            redata = re.compile(re.escape(item[0]),re.IGNORECASE)
+            doc = redata.sub(item[1], doc)
+        
+        return doc 
+    
+    elif type(phrase_tups).__name__ =='list':
+        for item in phrase_tups: 
+            redata = re.compile(re.escape(item[0]),re.IGNORECASE)
+            doc = redata.sub(item[1], doc)
+        return doc 
+    else: 
+        raise Exception('phrases to substitute must be in form of dictionary or tuple')
+    
+
+
+
+def build_wordfreq_stat_dict(word_tokenized_doc_list):
+    """
+    Builds a word frequency statistics dictionary from a list of word tokenized documents.
+
+    Args:
+        word_tokenized_doc_list (list): A list of word tokenized documents.
+
+    Returns:
+        dict: A dictionary containing the word frequency statistics, where the keys are the tokens and the values are the frequencies.
+
+    Example:
+        >>> word_tokenized_doc_list = [['I', 'love', 'programming'], ['Programming', 'is', 'fun']]
+        >>> build_wordfreq_stat_dict(word_tokenized_doc_list)
+        {'I': 1, 'love': 1, 'programming': 2, 'is': 1, 'fun': 1}
+    """
+    corpus_len = 0
+    word_freq_dict = defaultdict(int)
+    for _list in word_tokenized_doc_list:
+        for _sentence in _list:
+            for token in _sentence:
+                word_freq_dict[token] += 1
+                corpus_len += 1
+    return word_freq_dict
