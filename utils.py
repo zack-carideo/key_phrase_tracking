@@ -1,10 +1,19 @@
-import sys, os,  requests, io, zipfile , re 
+import sys, os,  requests, io, zipfile , re, itertools, collections ,yake, logging , datetime
 from collections import defaultdict
 from typing import Dict, List
 from nltk.stem import PorterStemmer
 import numpy as np  
 import pandas as pd 
 from sklearn.feature_extraction.text import TfidfTransformer, TfidfVectorizer
+from fuzzywuzzy import process
+from itertools import chain
+import polars as pl
+
+#logger
+logger = logging.getLogger(__name__)
+logging.basicConfig()
+logging.getLogger().setLevel(logging.DEBUG)
+
 
 #stemmer    
 stemmer = PorterStemmer()
@@ -166,3 +175,110 @@ def build_wordfreq_stat_dict(word_tokenized_doc_list):
                 word_freq_dict[token] += 1
                 corpus_len += 1
     return word_freq_dict
+
+
+#spacy keyword extraction
+def get_keywords_using_spacy(text: str, nlp, pos_tag: List[str] = ['PROPN', 'ADJ', 'NOUN'],stopwords=None) -> List[str]:
+    """
+    Extracts keywords from the given text using spaCy.
+
+    Args:
+        text (str): The input text from which keywords need to be extracted.
+        pos_tag (List[str], optional): The list of part-of-speech tags to consider as keywords.
+            Defaults to ['PROPN', 'ADJ', 'NOUN'].
+
+    Returns:
+        List[str]: The list of extracted keywords.
+
+    """
+    doc = nlp(text)
+
+    # Set the hot words as the words with pos tag “PROPN“, “ADJ“, or “NOUN“. (POS tag list is customizable)
+    keywords = ([token.text for token in doc if token not in stopwords if not token.is_punct if token.pos_ in pos_tag])
+
+    return keywords
+
+
+### Option 2: PyTextRank  keyword exrtraction
+def get_topN_keywords_TextRank(text: str, nlp, max_len: int = 4, top_N: int = 20):
+    """
+    Extracts the top N keywords from the given text using TextRank algorithm.
+
+    Parameters:
+    text (str): The input text from which keywords will be extracted.
+    max_len (int): The maximum length of the keyword (in words). Default is 4.
+    top_N (int): The number of top keywords to be extracted. Default is 20.
+
+    Returns:
+    list: A list of the top N extracted keywords.
+    """
+    
+    doc = nlp(text)
+    
+    # keeping tri-grams
+    keywords = [keyword.text for keyword in doc._.phrases if len(keyword.text.split()) <= max_len]
+    
+    # Remove duplicate keywords with customized threshold
+    unique_keywords = list(process.dedupe(keywords, threshold=80))
+    extracted_keywords = unique_keywords[:top_N]
+    
+    return extracted_keywords
+
+
+
+def nltk_ngram_summary_from_polars(df, nltk_grams_colname='nltk_bigrams', top_n=5):
+    """
+    Generate a summary of the most common n-grams in a Polars DataFrame.
+
+    Args:
+        df (polars.DataFrame): The input Polars DataFrame.
+        nltk_grams_colname (str, optional): The name of the column containing the NLTK n-grams. Defaults to 'nltk_bigrams'.
+        top_n (int, optional): The number of most common n-grams to return. Defaults to 5.
+
+    Returns:
+        list: A list of tuples representing the most common n-grams and their counts.
+    """
+    
+    #convert dataframe values back into list of tuples (or list of lists where each inner list is a 2 element list of bigram components)
+    terms = [x.to_list() for x in df[nltk_grams_colname]]
+    
+    # Create counter of words in clean bigrams
+    gram3_list = [(t[0],t[1]) for t in itertools.chain(*terms)]
+    gram3_counts = collections.Counter(gram3_list)
+
+    return gram3_counts.most_common(top_n)
+
+
+def get_topN_keywords_YAKE(text: str, top_N: int, max_ngram_size = 3, deduplication_threshold=.75, deduplication_algo='seqm', windowSize=1) -> str:
+    """
+    Extracts the top N keywords from the given text using the YAKE keyword extraction algorithm.
+
+    Parameters:
+    text (str): The input text from which keywords need to be extracted.
+    top_N (int): The number of top keywords to be extracted.
+
+    Returns:
+    str: A string containing the extracted keywords separated by commas.
+    """
+    
+    # specifying parameters
+    
+
+    custom_kw_extractor = yake.KeywordExtractor(lan='en', 
+                                                n=max_ngram_size, 
+                                                dedupLim=deduplication_threshold, 
+                                                dedupFunc=deduplication_algo, 
+                                                windowsSize=windowSize
+                                                , top=top_N
+                                                )
+    
+    keywords_with_scores = custom_kw_extractor.extract_keywords(text)
+    keywords = [x[0] for x in keywords_with_scores]
+    
+    # Remove duplicate keywords with customized threshold
+    unique_keywords = list(process.dedupe(keywords, threshold=75))
+    extracted_keywords = ", ".join(unique_keywords)
+    
+    return extracted_keywords
+
+

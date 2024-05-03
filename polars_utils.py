@@ -11,6 +11,16 @@ from nltk.stem import PorterStemmer
 from spello.model import SpellCorrectionModel
 import polars as pl 
 from collections import defaultdict
+import logging, datetime
+from itertools import chain
+import numpy as np
+import pandas as pd
+
+#logger
+logger = logging.getLogger(__name__)
+logging.basicConfig()
+logging.getLogger().setLevel(logging.DEBUG)
+
 #stemmer 
 stemmer = PorterStemmer()
 stopwords = nltk.corpus.stopwords.words('english')
@@ -367,3 +377,261 @@ def ngram_phraser(word_tokenized_doc_list, score_method = 'Student_test', ngram_
     doc_to_ngram = [doc_ngram_dict[i] for i in range(len(word_tokenized_doc_list))]
 
     return ngramTable, doc_to_ngram
+
+
+
+
+
+
+def gen_control_limits(df: pl.DataFrame
+                       , date_col: str= None
+                       , start_date: datetime.datetime = None
+                       , end_date: datetime.datetime = None 
+                       , cur_date: datetime.datetime = None
+
+                       , stopwords = None
+                       , stopgrams = None
+                       , ngram_len: int = 2
+                       , ngram_min_freq: int = 10
+
+                       , ngram_cutoff_periods:int = None
+                       , ngram_pval_thresh: float = None 
+                       , ngram_pmi_thresh:float = None
+                       , max_tfidf_ngrams:int  = None
+                       , rule1_topn: int = None
+                       , d2: float = None):
+    
+    if stopwords is None: 
+        stopwords = []
+    if stopgrams is None: 
+        stopgrams = []
+
+    #load data, format dates, and subset based on in scope date range 
+    cl_data = (df.with_columns(date_col = pl.col(date_col).str.to_datetime("%m/%d/%Y"))
+            ).with_columns(
+                pl.col('date_col').map_elements(
+                    lambda x: datetime.datetime(x.year,x.month,x.day)- datetime.timedelta(days=datetime.datetime(x.year,x.month,x.day).weekday()-4)
+                    if datetime.datetime(x.year,x.month,x.day).weekday() in [5,6] 
+                    else datetime.datetime(x.year,x.month,x.day))
+                ).sort(by='date_col'
+                    ).filter((pl.col('date_col')>=start_date) & (pl.col('date_col')<=cur_date))
+
+    logger.debug(f"Dataframe shape after filtering: {cl_data.shape}")
+    logger.debug(f"Dataframe contains ndates after filtering: {cl_data.select(pl.col('date_col')).n_unique()}")
+    logger.debug(f"Dataframe contains nunique complaints after filtering: {cl_data.select(pl.col('input_col')).n_unique()}")
+
+    if cl_data.shape[0]<1: 
+        raise Exception(f"No data exists in date range specified. Data exists between {cl_data.select(pl.col('date_col').min())} and {cl_data.select(pl.col('date_col').max())} for reference")
+
+
+    #ngramcutoff (we only identify ngrams that are found prior to the ngram cutoff date, this ensure we have enough 'future' periods to evaluate control limits)
+    ngram_cutoff_date= sorted([v[0] for v in cl_data.select('date_col').unique().to_numpy()])[-ngram_cutoff_periods]
+
+    #
+    #get ngrams
+    #
+
+    #PMI
+    ngramTable_pmi, doc_to_ngram_pmi = ngram_phraser(
+                                                    [v for v in cl_data.filter(pl.col('date_col')<= ngram_cutoff_date).select(['word_tokens'])][0]
+                                                    , score_method = 'PMI'
+                                                    , ngram_len =ngram_len
+                                                    , min_freq=ngram_min_freq
+                                                    , pmi_thresh =ngram_pmi_thresh)
+
+
+    ngramTable_pmi = ngramTable_pmi.filter(pl.col('N-PMI')>=pmi_thresh).sort(by=['N-PMI','ngram_freq'],descending=True)
+
+    #Chi2
+    ngramTable_chi2, doc_to_ngram_chi2 = ngram_phraser(
+                                                    [v for v in cl_data.filter(pl.col('date_col')<= ngram_cutoff_date).select(['word_tokens'])][0]
+                                                    , score_method = 'Chi_sq'
+                                                    , ngram_len = ngram_len
+                                                    , min_freq= ngram_min_freq
+                                                    , tthresh =ngram_pval_thresh) #the pval for chi2 and t-test
+
+
+    ngramTable_chi2 = ngramTable_chi2.filter(pl.col('p')<=tthresh).sort(by=['chi-sq','ngram_freq'],descending=True).head(200)
+
+    #ttest
+    ngramTable_ttest, doc_to_ngram_ttest = ngram_phraser(
+                                                    [v for v in cl_data.filter(pl.col('date_col')<= ngram_cutoff_date).select(['word_tokens'])][0]
+                                                    , score_method = 'Student_t'
+                                                    , ngram_len =ngram_len
+                                                    , min_freq=7
+                                                    , tthresh =tthresh)
+
+
+    ngramTable_ttest = ngramTable_chi2.filter(pl.col('p')<=ngram_pval_thresh).sort(by=['p','ngram_freq'],descending=True).head(300)
+
+    #unigrams 
+    ngramTable_tfidf = get_top_idf_terms(cl_data['word_tokens'].apply(lambda x: list(chain.from_iterable(x))).to_pandas(), topn=max_tfidf_ngrams
+                                        , sent_tokenized=False, stopwords=[v for v in stopwords])
+
+
+    #combine ngrams from all three approaches 
+    #filter out ngrams with stopgrams 
+    ngram_list = list(set(list(ngramTable_pmi['ngram']) + list(ngramTable_chi2['ngram']) + list(ngramTable_ttest['ngram']) + list(ngramTable_tfidf['term'])))
+    ngram_list_final = [s for s in ngram_list if all(xs.lower() not in s.lower() for xs in stopgrams)]
+    logger.info(f"{len(ngram_list)-len(ngram_list_final)} ngram removed due to stopgrams")
+    logger.info(f"ngram generation complete. {ngramTable_ttest['ngram'].n_unique()} ngrams generated from ttest, {ngramTable_chi2['ngram'].n_unique()} ngrams generated from chi2, {ngramTable_pmi['ngram'].n_unique()} ngrams generated from pmi, and {len(ngramTable_tfidf['term'].unique())} ngrams generated from tfidf")
+    logger.info(f"total of {len(ngram_list_final)} ngrams generated after filtering out stopgrams")
+    
+    #incorporate static ngrams into text 
+    logger.info(f"ngram substitution begining for {len([len(ngram.split('_')) for ngram in ngram_list_final if len(ngram.split('_'))>1])}")
+    ngram_map_tups = [((' '.join(ngram.split('_'))),ngram) for ngram in ngram_list_final if len(ngram.split('_'))>1]
+
+    #incorp static phrases into document 
+    cl_data = cl_data.select([pl.col('*')
+             , (pl.col('word_tokens').apply(lambda x:  incorp_static_phrases(' '.join([v for v in list(chain.from_iterable(x)) if v not in stopgrams]),ngram_map_tups).split())).alias('word_tokens2')])
+
+
+    #part3
+    #generate count freqs for each data and % of total freqs for each unigram 
+    
+    count_stats_dict = defaultdict(dict)
+    for i,dt in enumerate(sorted(set([v for v in cl_data.select('date_col').to_series()]))): 
+        df_t = cl_data.filter(pl.col('date_col')==dt).select([pl.col('word_tokens2')])
+        if len(df_t)>0: 
+            count_stats_dict[dt] = build_wordfreq_stat_dict(df_t)
+        else:
+            print(dt)
+
+    #convert count stats from dict to df (index = key phrases, columns = date counts)
+    cnt_summary_df = pd.DataFrame.from_dict(count_stats_dict).fillna(0)
+
+
+    #Control limit start 
+    try: 
+        start_date_train = pd._libs.tslib.Timestamp(start_date)
+        start_date_train_idx = list(cnt_summary_df.columns>=start_date_train).index(True)
+    except Exception: 
+        raise ValueError("An error occurred while processing the start date. Please ensure it's in the correct format.")
+
+
+
+    try:
+        end_date_train  = pd._libs.tslib.Timestamp(end_date)
+
+        if end_date_train < max(cnt_summary_df.columns):
+            logger.info(f"end date {end_date_train} is prior to last date in data {max(cnt_summary_df.columns)}")
+            end_date_train_idx = list(cnt_summary_df.columns>end_date_train).index(True)-1
+        if end_date_train == max(cnt_summary_df.columns):
+            logger.info(f"end date {end_date_train} is the last date in data {max(cnt_summary_df.columns)}")
+            end_date_train_idx = list(cnt_summary_df.columns>= end_date_train).index(True)
+        if end_date_train > max(cnt_summary_df.columns):
+            logger.info(f"end date {end_date_train} is after last date in data {max(cnt_summary_df.columns)}")
+            nearest_date_end = nearest(cnt_summary_df.columns, end_date_train) 
+            logger.info(f"closest date to end date is {nearest_date_end}")
+            end_date_train_idx = list(cnt_summary_df.columns>=nearest_date_end).index(True)
+        
+    except Exception: 
+        raise Exception("start and end date assignment failed")
+
+    #id current date, or date closest to current date 
+    cur_date_test = pd._libs.tslib.Timestamp(cur_date)
+
+    try: 
+        cur_date_test_idx = cnt_summary_df.columns.get_loc(cur_date_test)
+    except: 
+        nearest_date = nearest(cnt_summary_df.columns, cur_date_test)
+        cur_date_test_idx = cnt_summary_df.columns.get_loc(nearest_date)
+
+
+
+    #part 5: build control limit thresholds 
+
+    #filter 
+    DataDev = cnt_summary_df.iloc[:,start_date_train_idx:cur_date_test_idx+1].copy()
+    DataDev = DataDev.loc[[v for v in ngram_list_final if v in DataDev.index.values]].fillna(0)
+
+    #control limit derived inputs (how long back to use in establishing means)
+    K = end_date_train_idx - start_date_train_idx + 1   # number of days to use in building control limits  
+    curIdx = cur_date_test_idx-start_date_train_idx     # index for current day in DataDev datafarme
+    showK = cur_date_test_idx - start_date_train_idx + 1 # tommorrows day in DataDev dataset (t+1)
+
+
+    #calculate x mean 
+    DataDev['x_bar'] = np.average(DataDev.iloc[:,:K],axis=1)
+
+    #calc moving avg 
+    MR_sum = 0 
+    for i in range(K-1):
+        MR_sum += abs(DataDev.iloc[:,i+1] - DataDev.iloc[:,i])
+
+    DataDev['MR_avg'] = MR_sum/(K-1)
+    DataDev['sigma'] = DataDev['MR_avg']/d2
+
+    #UPPER AND LOWER CONTROL LIMITS(3std from moving avg) 
+    DataDev['LCL'] = DataDev['x_bar'] - 3*DataDev['sigma']
+    DataDev['UCL'] = DataDev['x_bar'] + 3*DataDev['sigma']  
+
+    #Zone 1 Upper and lower limits 
+    DataDev['LCL_ZoneA_l'] = DataDev['LCL']
+    DataDev['LCL_ZoneA_u'] = DataDev['x_bar'] - 2*DataDev['sigma']
+    DataDev['UCL_ZoneA_l'] = DataDev['x_bar'] + 2*DataDev['sigma'] 
+    DataDev['UCL_ZoneA_u'] = DataDev['UCL']
+
+    #Zone 2 Upper and Lower Limits 
+    DataDev['LCL_ZoneB_l'] = DataDev['x_bar'] - 2*DataDev['sigma']
+    DataDev['LCL_ZoneB_u'] = DataDev['x_bar'] -  DataDev['sigma'] 
+    DataDev['UCL_ZoneB_l'] = DataDev['x_bar'] + DataDev['sigma'] 
+    DataDev['UCL_ZoneB_u'] = DataDev['x_bar'] + 2*DataDev['sigma']
+
+    #Zone 3 Upper and Lower Limits
+    DataDev['LCL_ZoneC_l'] = DataDev['x_bar'] - DataDev['sigma']
+    DataDev['LCL_ZoneC_u'] = DataDev['x_bar'] 
+    DataDev['UCL_ZoneC_l'] = DataDev['x_bar']  
+    DataDev['UCL_ZoneC_u'] = DataDev['x_bar'] + DataDev['sigma']
+
+
+    #part 6: generate rules to identify key phrases that are emerging in some degree 
+
+    #Rule 1: Beyond limits (one or more points beyond the control limits)
+    DataDev['Rule1'] = DataDev.iloc[:,curIdx]>DataDev['UCL']
+    DataDev['Rule1_pct'] = (DataDev.iloc[:,curIdx]-DataDev['UCL'])/DataDev['UCL']
+    DataDev = DataDev.replace([np.inf, -np.inf], np.nan).sort_values(by='Rule1_pct', ascending=False)
+    plot_rule1 = DataDev[DataDev['Rule1']==True].sort_values(by='Rule1_pct', ascending=False).iloc[:rule1_topn, :showK].transpose()
+    logger.info(f"Rule 1 Ngrams: {list(plot_rule1)}")
+
+
+    #Rule 2: Zone A(2 out of 3 consequtive points in Zone A or beyond)
+    _tmp = DataDev.iloc[:,curIdx-2:curIdx+1]
+    for i in range(3):
+        _tmp.iloc[:,i] = (_tmp.iloc[:,i]>DataDev['UCL_ZoneA_l'])
+
+    DataDev['Rule2'] = (_tmp.sum(axis=1)==2) & (_tmp.iloc[:,-1]==True)
+    plot_rule2 = DataDev[DataDev['Rule2']==True].iloc[:,:showK].transpose()
+    logger.info(f"Rule 2 Ngrams: {list(plot_rule2)}")
+
+
+    #Rule 3: Zone B (4 out of 5 consecutive points in Zone B or beyond)
+    _tmp = DataDev.iloc[:,curIdx-4:curIdx+1]
+    for i in range(5):
+        _tmp.iloc[:,i] = (_tmp.iloc[:,i]>DataDev['UCL_ZoneB_l'])
+
+    DataDev['Rule3'] = (_tmp.sum(axis=1)==4) & (_tmp.iloc[:,-1]==True)
+    plot_rule3 = DataDev[DataDev['Rule3']==True].iloc[:,:showK].transpose()
+    logger.info(f"Rule 3 Ngrams: {list(plot_rule3)}")
+
+
+    #Rule 4: Zone C (7 or more consecutive points on one side of the average(in Zone C or beyond))
+    _tmp = DataDev.iloc[:,curIdx-6:curIdx+1]
+    for i in range(7):
+        _tmp.iloc[:,i] = (_tmp.iloc[:,i]>DataDev['UCL_ZoneC_l'])
+
+    DataDev['Rule4'] = (_tmp.sum(axis=1)==7) 
+    plot_rule4 = DataDev[DataDev['Rule4']==True].iloc[:,:showK].transpose()
+    logger.info(f"Rule 4 Ngrams: {list(plot_rule4)}")
+
+    #Rule 5(trending up): Trend(7 conseecutive points trending up or trending down)
+    _tmp = DataDev.iloc[:,:curIdx+1]
+    for i in range(curIdx-5, curIdx+1):
+        _tmp.iloc[:,i] = (DataDev.iloc[:,i]>DataDev.iloc[:,i-1])
+
+
+    DataDev['Rule5_trend'] = (_tmp.iloc[:,curIdx-5:].sum(axis=1)==6)
+    plot_rule5 = DataDev[DataDev['Rule5_trend']==True].iloc[:,:showK].transpose()
+    logger.info(f"Rule 5 Ngrams: {list(plot_rule5)}")
+
+    return DataDev, plot_rule1, plot_rule2, plot_rule3, plot_rule4, plot_rule5
